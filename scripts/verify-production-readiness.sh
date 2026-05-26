@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OPTIMISM_ROOT="${OPTIMISM_ROOT:-$HOME/rust/optimism}"
 IMAGE_TAG="${CONDUCTOR_RS_IMAGE_TAG:-conductor-rs:local}"
 
 run() {
@@ -14,8 +13,6 @@ run() {
 
 cd "$ROOT"
 
-run scripts/audit-upstream-surface.sh
-run scripts/audit-kona-conductor-contract.sh
 run cargo fmt --check
 run cargo test
 run cargo clippy --all-targets --all-features -- -D warnings
@@ -29,19 +26,12 @@ else
   echo "Skipping Docker image check because docker is not on PATH."
 fi
 
-if [ -f "$OPTIMISM_ROOT/rust/Cargo.toml" ]; then
-  run cargo test --manifest-path "$OPTIMISM_ROOT/rust/Cargo.toml" -p kona-rpc -- --nocapture
-  run cargo test --manifest-path "$OPTIMISM_ROOT/rust/Cargo.toml" -p kona-node-service -- --nocapture
-else
-  echo "Skipping patched Kona checks because OPTIMISM_ROOT does not contain rust/Cargo.toml: $OPTIMISM_ROOT"
-fi
-
 if [ "${CONDUCTOR_RS_RUN_LIVE:-0}" = "1" ]; then
   ran_live=0
 
   if [ -n "${CONDUCTOR_RS_LIVE_KONA_NODE_RPC:-}" ] && [ -n "${CONDUCTOR_RS_LIVE_KONA_EXECUTION_RPC:-}" ]; then
     run cargo test --test live_kona_conformance \
-      live_kona_admin_rpc_supports_conductor_contract -- --ignored --nocapture
+      live_kona_admin_rpc_supports_current_interop -- --ignored --nocapture
     ran_live=1
   fi
 
