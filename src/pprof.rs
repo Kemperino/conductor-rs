@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::{
     future::Future,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::{Path, PathBuf, MAIN_SEPARATOR},
     time::Duration,
 };
 
@@ -208,12 +208,20 @@ fn build_profile_body(guard: &pprof::ProfilerGuard<'_>) -> anyhow::Result<Vec<u8
 
 fn profile_target_path(path: Option<&Path>, default_filename: &str) -> PathBuf {
     match path {
-        Some(path) if path.metadata().is_ok_and(|metadata| metadata.is_dir()) => {
-            path.join(default_filename)
-        }
+        Some(path) if is_profile_dir_path(path) => path.join(default_filename),
         Some(path) => path.to_path_buf(),
         None => PathBuf::from(default_filename),
     }
+}
+
+fn is_profile_dir_path(path: &Path) -> bool {
+    if path.metadata().is_ok_and(|metadata| metadata.is_dir()) {
+        return true;
+    }
+
+    // Match op-service's PathFlag behavior for a non-existing path that still
+    // carries directory intent, e.g. `--pprof.path /tmp/profiles/`.
+    path.to_string_lossy().ends_with(MAIN_SEPARATOR)
 }
 
 #[cfg(test)]
@@ -280,6 +288,30 @@ mod tests {
 
         assert!(target.exists());
         assert!(std::fs::metadata(target).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn profile_target_path_preserves_explicit_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("profile.out");
+
+        assert_eq!(
+            profile_target_path(Some(&target), CPU_PROFILE_FILENAME),
+            target
+        );
+    }
+
+    #[test]
+    fn profile_target_path_uses_default_file_for_directory_style_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("profiles");
+        let directory_style_path =
+            PathBuf::from(format!("{}{}", target_dir.display(), MAIN_SEPARATOR));
+
+        assert_eq!(
+            profile_target_path(Some(&directory_style_path), CPU_PROFILE_FILENAME),
+            target_dir.join(CPU_PROFILE_FILENAME)
+        );
     }
 
     #[tokio::test]

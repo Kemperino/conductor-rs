@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OPTIMISM_ROOT="${OPTIMISM_ROOT:-$HOME/rust/optimism}"
 
 require_file() {
@@ -37,9 +38,12 @@ rpc_admin="$OPTIMISM_ROOT/rust/kona/crates/node/rpc/src/admin.rs"
 rpc_client="$OPTIMISM_ROOT/rust/kona/crates/node/rpc/src/client.rs"
 rpc_jsonrpsee="$OPTIMISM_ROOT/rust/kona/crates/node/rpc/src/jsonrpsee.rs"
 sequencer_rpc_client="$OPTIMISM_ROOT/rust/kona/crates/node/service/src/actors/rpc/sequencer_rpc_client.rs"
+sequencer_config="$OPTIMISM_ROOT/rust/kona/crates/node/service/src/actors/sequencer/config.rs"
 sequencer_actor="$OPTIMISM_ROOT/rust/kona/crates/node/service/src/actors/sequencer/actor.rs"
 sequencer_admin="$OPTIMISM_ROOT/rust/kona/crates/node/service/src/actors/sequencer/admin_api_impl.rs"
 sequencer_conductor="$OPTIMISM_ROOT/rust/kona/crates/node/service/src/actors/sequencer/conductor.rs"
+sequencer_flags="$OPTIMISM_ROOT/rust/kona/bin/node/src/flags/sequencer.rs"
+service_node="$OPTIMISM_ROOT/rust/kona/crates/node/service/src/service/node.rs"
 actor_tests="$OPTIMISM_ROOT/rust/kona/crates/node/service/src/actors/sequencer/tests/actor_test.rs"
 admin_tests="$OPTIMISM_ROOT/rust/kona/crates/node/service/src/actors/sequencer/tests/admin_api_impl_test.rs"
 
@@ -48,9 +52,12 @@ for file in \
   "$rpc_client" \
   "$rpc_jsonrpsee" \
   "$sequencer_rpc_client" \
+  "$sequencer_config" \
   "$sequencer_actor" \
   "$sequencer_admin" \
   "$sequencer_conductor" \
+  "$sequencer_flags" \
+  "$service_node" \
   "$actor_tests" \
   "$admin_tests"; do
   require_file "$file"
@@ -81,6 +88,16 @@ require_source "$sequencer_conductor" "Kona must propagate the upstream override
   'request\("conductor_overrideLeader",\s*\[true\]\)'
 require_source "$sequencer_conductor" "overrideLeader parameter compatibility must be unit tested" \
   'async\s+fn\s+override_leader_sends_upstream_bool_param\(\)'
+require_source "$sequencer_flags" "sequencer CLI config must preserve conductor RPC timeout" \
+  'conductor_rpc_timeout:\s*self\.conductor_rpc_timeout'
+require_source "$sequencer_config" "sequencer config must carry conductor RPC timeout" \
+  'pub\s+conductor_rpc_timeout:\s*Duration'
+require_source "$service_node" "service startup must pass configured conductor RPC timeout" \
+  'ConductorClient::new_http\(url,\s*self\.sequencer_config\.conductor_rpc_timeout\)'
+require_source "$sequencer_conductor" "conductor RPC client must apply configured HTTP timeout" \
+  'reqwest::Client::builder\(\)\.timeout\(timeout\)\.build\(\)\?.*ReqwestClient::new_http_with_client\(client,\s*url\)'
+require_source "$sequencer_conductor" "conductor RPC timeout behavior must be unit tested" \
+  'async\s+fn\s+conductor_rpc_calls_use_configured_timeout\(\)'
 
 require_source "$sequencer_actor" "sequencing must honor local conductor leader override" \
   'if\s+!self\.conductor_leader_overridden\s*\{.*commit_unsafe_payload\(&payload\)\.await'
@@ -98,5 +115,11 @@ require_source "$admin_tests" "hash-gated startSequencer behavior must stay cove
   'test_start_sequencer_checks_expected_unsafe_head'
 require_source "$admin_tests" "overrideLeader behavior must stay covered" \
   'test_override_leader'
+require_source "$ROOT/tests/binary_cluster_failover.rs" "binary raft membership demote/remove behavior must stay covered" \
+  'conductor_binary_demotes_current_leader_and_removes_raft_member'
+require_source "$rpc_admin" "admin_postUnsafePayload must stay covered for V2/V3/V4 conductor repair payloads" \
+  'admin_post_unsafe_payload_accepts_current_fork_payload_versions'
+require_source "$rpc_admin" "admin_postUnsafePayload must reject current-fork payloads without parent beacon roots" \
+  'unsafe_payload_hash_validation_rejects_cancun_payload_without_parent_beacon_root'
 
 echo "Kona conductor contract audit passed"

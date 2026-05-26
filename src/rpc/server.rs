@@ -7,12 +7,16 @@ use crate::{
 };
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
     http::{header::CONTENT_TYPE, StatusCode},
     response::{IntoResponse, Response as AxumResponse},
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{net::SocketAddr, sync::Arc, time::Instant};
@@ -101,7 +105,9 @@ where
         }),
     });
     let app = Router::new()
-        .route("/", post(handle::<C, S>))
+        .route("/", get(ws_handler::<C, S>).post(handle::<C, S>))
+        .route("/ws", get(ws_handler::<C, S>))
+        .route("/ws/", get(ws_handler::<C, S>))
         .route("/healthz", get(healthz))
         .route("/healthz/", get(healthz))
         .with_state(state);
@@ -132,6 +138,53 @@ where
     match handle_bytes(state, &body).await {
         Some(response) => Json(response).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+async fn ws_handler<C, S>(
+    State(state): State<SharedState<C, S>>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse
+where
+    C: Consensus + 'static,
+    S: SequencerControl + 'static,
+{
+    ws.on_upgrade(move |socket| handle_ws(state, socket))
+}
+
+async fn handle_ws<C, S>(state: SharedState<C, S>, mut socket: WebSocket)
+where
+    C: Consensus + 'static,
+    S: SequencerControl + 'static,
+{
+    while let Some(message) = socket.next().await {
+        let Ok(message) = message else {
+            break;
+        };
+        let response = match message {
+            Message::Text(text) => handle_bytes(state.clone(), text.as_bytes()).await,
+            Message::Binary(bytes) => handle_bytes(state.clone(), bytes.as_ref()).await,
+            Message::Ping(bytes) => {
+                if socket.send(Message::Pong(bytes)).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            Message::Pong(_) => continue,
+            Message::Close(frame) => {
+                let _ = socket.send(Message::Close(frame)).await;
+                break;
+            }
+        };
+        let Some(response) = response else {
+            continue;
+        };
+        let Ok(text) = serde_json::to_string(&response) else {
+            break;
+        };
+        if socket.send(Message::Text(text)).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -723,6 +776,7 @@ mod tests {
         http::{Request as HttpRequest, StatusCode},
         routing::post,
     };
+    use futures_util::{SinkExt, StreamExt};
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
@@ -828,7 +882,16 @@ mod tests {
         Router::new()
             .route(
                 "/",
-                post(handle::<LocalConsensus<FilePayloadStore>, FakeSequencer>),
+                get(ws_handler::<LocalConsensus<FilePayloadStore>, FakeSequencer>)
+                    .post(handle::<LocalConsensus<FilePayloadStore>, FakeSequencer>),
+            )
+            .route(
+                "/ws",
+                get(ws_handler::<LocalConsensus<FilePayloadStore>, FakeSequencer>),
+            )
+            .route(
+                "/ws/",
+                get(ws_handler::<LocalConsensus<FilePayloadStore>, FakeSequencer>),
             )
             .route("/healthz", get(healthz))
             .route("/healthz/", get(healthz))
@@ -1024,7 +1087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_rpc_is_not_enabled_on_op_conductor_rpc_port() {
+    async fn websocket_rpc_supports_upstream_main_rpc_endpoint() {
         let app = router().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1033,18 +1096,27 @@ mod tests {
         });
 
         for path in ["/", "/ws", "/ws/"] {
-            let result = tokio_tungstenite::connect_async(format!("ws://{addr}{path}")).await;
-            let Err(err) = result else {
-                panic!("expected websocket rejection for {path}");
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}{path}"))
+                .await
+                .unwrap();
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"jsonrpc":"2.0","id":1,"method":"conductor_leader","params":[]}"#.into(),
+            ))
+            .await
+            .unwrap();
+
+            let response = ws.next().await.unwrap().unwrap();
+            let tokio_tungstenite::tungstenite::Message::Text(text) = response else {
+                panic!("expected websocket text response for {path}, got {response:?}");
             };
-            let tokio_tungstenite::tungstenite::Error::Http(response) = err else {
-                panic!("expected HTTP websocket rejection for {path}, got {err:?}");
-            };
-            assert_ne!(
-                response.status(),
-                axum::http::StatusCode::SWITCHING_PROTOCOLS
+            let payload: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                payload,
+                json!({"jsonrpc":"2.0","id":1,"result":true}),
+                "{path}"
             );
         }
+
         server.abort();
     }
 

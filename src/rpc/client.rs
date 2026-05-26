@@ -34,7 +34,13 @@ impl RpcClientError {
     }
 
     pub fn is_method_not_found(&self) -> bool {
-        matches!(self, Self::JsonRpc { code: -32601, .. })
+        match self {
+            Self::JsonRpc { code: -32601, .. } => true,
+            Self::JsonRpc { message, .. } => {
+                message.to_ascii_lowercase().contains("method not found")
+            }
+            _ => false,
+        }
     }
 }
 
@@ -301,6 +307,28 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn method_not_found_detection_matches_upstream_code_or_message() {
+        assert!(RpcClientError::JsonRpc {
+            code: -32601,
+            message: "missing".to_string(),
+            data: None,
+        }
+        .is_method_not_found());
+        assert!(RpcClientError::JsonRpc {
+            code: -32000,
+            message: "Method not found".to_string(),
+            data: None,
+        }
+        .is_method_not_found());
+        assert!(!RpcClientError::JsonRpc {
+            code: -32000,
+            message: "temporarily unavailable".to_string(),
+            data: None,
+        }
+        .is_method_not_found());
     }
 
     #[tokio::test]

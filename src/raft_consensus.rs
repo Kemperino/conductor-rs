@@ -101,11 +101,9 @@ impl RaftConsensusConfig {
             heartbeat_interval: millis(self.heartbeat_interval),
             election_timeout_min: millis(self.election_timeout_min),
             election_timeout_max: millis(self.election_timeout_max),
-            snapshot_policy: if self.snapshot_threshold == 0 {
-                SnapshotPolicy::Never
-            } else {
-                SnapshotPolicy::LogsSinceLast(self.snapshot_threshold)
-            },
+            // Hashicorp raft checks snapshot thresholds on SnapshotInterval ticks; OpenRaft has no
+            // interval knob, so conductor-rs drives that check in start_snapshot_loop.
+            snapshot_policy: SnapshotPolicy::Never,
             max_in_snapshot_log_to_keep: self.trailing_logs,
             ..Default::default()
         };
@@ -570,6 +568,7 @@ pub struct RaftConsensus {
     raft: OpenRaft,
     store: Arc<MemoryRaftStore>,
     bootstrapped: AtomicBool,
+    snapshot_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl RaftConsensus {
@@ -620,6 +619,9 @@ impl RaftConsensus {
                 .await?;
             consensus.bootstrapped.store(true, Ordering::SeqCst);
         }
+        consensus
+            .start_snapshot_loop(config.snapshot_interval, config.snapshot_threshold)
+            .await;
         Ok(consensus)
     }
 
@@ -643,7 +645,36 @@ impl RaftConsensus {
             raft,
             store,
             bootstrapped: AtomicBool::new(false),
+            snapshot_task: Mutex::new(None),
         }))
+    }
+
+    async fn start_snapshot_loop(&self, interval: Duration, threshold: u64) {
+        if interval.is_zero() || threshold == 0 {
+            return;
+        }
+
+        let id = self.id.clone();
+        let raft = self.raft.clone();
+        let store = self.store.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                match store.should_snapshot(threshold).await {
+                    Ok(true) => {
+                        if let Err(err) = raft.trigger().snapshot().await {
+                            tracing::warn!(%id, %err, "periodic raft snapshot trigger failed");
+                            break;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(%id, %err, "failed to inspect raft snapshot threshold");
+                    }
+                }
+            }
+        });
+        *self.snapshot_task.lock().await = Some(handle);
     }
 
     pub fn bootstrapped(&self) -> bool {
@@ -695,6 +726,10 @@ impl RaftConsensus {
     }
 
     pub async fn shutdown(&self) -> Result<(), ConsensusError> {
+        if let Some(handle) = self.snapshot_task.lock().await.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
         self.raft.shutdown().await.map_err(raft_err)
     }
 
@@ -987,6 +1022,32 @@ impl MemoryRaftStore {
 
     async fn latest_payload(&self) -> Option<PayloadEnvelope> {
         self.sm.read().await.latest_unsafe_payload.clone()
+    }
+
+    async fn should_snapshot(&self, threshold: u64) -> Result<bool, io::Error> {
+        if threshold == 0 {
+            return Ok(false);
+        }
+        let Some(last_log_index) = self.log.read().await.keys().next_back().copied() else {
+            return Ok(false);
+        };
+        let snapshot_log_index = self
+            .current_snapshot
+            .read()
+            .await
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .meta
+                    .last_log_id
+                    .as_ref()
+                    .map(|log_id| log_id.index())
+            });
+        let logs_since_snapshot = match snapshot_log_index {
+            Some(snapshot_log_index) => last_log_index.saturating_sub(snapshot_log_index),
+            None => last_log_index.saturating_add(1),
+        };
+        Ok(logs_since_snapshot >= threshold)
     }
 
     async fn persist_to_disk(&self) -> Result<(), io::Error> {
@@ -1518,6 +1579,27 @@ mod tests {
         }
     }
 
+    async fn current_snapshot_id(node: &RaftConsensus) -> Option<String> {
+        node.store
+            .current_snapshot
+            .read()
+            .await
+            .as_ref()
+            .map(|snapshot| snapshot.meta.snapshot_id.clone())
+    }
+
+    async fn wait_snapshot_changed(node: &RaftConsensus, previous: Option<String>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = current_snapshot_id(node).await;
+            if current.is_some() && current != previous {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for snapshot");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     #[tokio::test]
     async fn raft_consensus_replicates_unsafe_payload_to_all_nodes() {
         let nodes = test_cluster().await;
@@ -1756,6 +1838,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_interval_loop_triggers_snapshot_after_threshold_like_hashicorp_raft() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = RaftConsensus::new_http(RaftConsensusConfig {
+            server_id: "seq-a".to_string(),
+            advertised_addr: "127.0.0.1:1001".to_string(),
+            storage_dir: dir.path().to_path_buf(),
+            bootstrap: true,
+            snapshot_interval: Duration::from_millis(20),
+            snapshot_threshold: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        node.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+        let previous_snapshot = current_snapshot_id(&node).await;
+
+        for offset in 0..2 {
+            node.commit_unsafe_payload(payload(50 + offset, 0x50 + offset as u8))
+                .await
+                .unwrap();
+        }
+
+        wait_snapshot_changed(&node, previous_snapshot).await;
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn persistent_raft_store_recovers_latest_payload_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let config = RaftConsensusConfig {
@@ -1786,6 +1895,41 @@ mod tests {
             restarted.latest_unsafe_payload().await.unwrap(),
             Some(expected)
         );
+        restarted.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_raft_store_can_commit_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RaftConsensusConfig {
+            server_id: "seq-a".to_string(),
+            advertised_addr: "127.0.0.1:1001".to_string(),
+            storage_dir: dir.path().to_path_buf(),
+            bootstrap: true,
+            ..Default::default()
+        };
+        let initial = payload(42, 0x42);
+        let next = payload(43, 0x43);
+
+        let node = RaftConsensus::new_http(config.clone()).await.unwrap();
+        node.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+        node.commit_unsafe_payload(initial.clone()).await.unwrap();
+        wait_payload(&node, initial).await;
+        node.shutdown().await.unwrap();
+
+        let restarted = RaftConsensus::new_http(RaftConsensusConfig {
+            bootstrap: true,
+            ..config
+        })
+        .await
+        .unwrap();
+        restarted
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .unwrap();
+        restarted.commit_unsafe_payload(next.clone()).await.unwrap();
+
+        assert_eq!(restarted.latest_unsafe_payload().await.unwrap(), Some(next));
         restarted.shutdown().await.unwrap();
     }
 }
