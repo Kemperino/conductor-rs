@@ -100,24 +100,9 @@ scripts/verify-production-readiness.sh
 The default readiness check is self-contained in this repository. It does not
 require an Optimism checkout, submodule, or workspace-specific path.
 
-Optional upstream conformance checks can compare this implementation against a
-local Optimism checkout. This is developer tooling, not a runtime or build
-dependency:
-
-```sh
-CONDUCTOR_RS_RUN_OPTIMISM_CHECKS=1 \
-  OPTIMISM_ROOT=/path/to/optimism \
-  scripts/verify-production-readiness.sh
-```
-
 To include live endpoint conformance, set
 `CONDUCTOR_RS_RUN_LIVE=1` with the relevant `CONDUCTOR_RS_LIVE_*` variables
 from the live validation section below.
-
-When enabled, `scripts/audit-upstream-surface.sh` derives the upstream
-`op-conductor` JSON-RPC methods, CLI flags, and flag env vars from
-`OPTIMISM_ROOT` and fails if the Rust binary/server no longer exposes that
-surface.
 
 Start exactly one node with `--raft.bootstrap` to create the initial cluster.
 Bring up additional nodes without bootstrap, then call

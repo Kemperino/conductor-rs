@@ -15,6 +15,10 @@ use url::Url;
 mod common;
 use common::{hash, kona_payload, kona_payload_hash, validate_kona_payload_shape};
 
+// These tests spawn multi-process Raft clusters; serialize them so free-port
+// probes and election timing do not interfere with each other.
+static BINARY_CLUSTER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Debug)]
 struct FakeKonaState {
     latest: Mutex<(Hash, u64)>,
@@ -561,6 +565,7 @@ fn free_port() -> u16 {
 
 #[tokio::test]
 async fn three_conductor_binaries_fail_over_and_repair_stale_kona_node() {
+    let _guard = BINARY_CLUSTER_TEST_LOCK.lock().await;
     let storage_dir = tempfile::tempdir().unwrap();
     let committed_hash = kona_payload_hash();
     let mut nodes = Vec::new();
@@ -700,6 +705,7 @@ async fn three_conductor_binaries_fail_over_and_repair_stale_kona_node() {
 
 #[tokio::test]
 async fn conductor_binary_demotes_current_leader_and_removes_raft_member() {
+    let _guard = BINARY_CLUSTER_TEST_LOCK.lock().await;
     let storage_dir = tempfile::tempdir().unwrap();
     let committed_hash = kona_payload_hash();
     let mut nodes = Vec::new();

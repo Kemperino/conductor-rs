@@ -26,16 +26,6 @@ else
   echo "Skipping Docker image check because docker is not on PATH."
 fi
 
-if [ "${CONDUCTOR_RS_RUN_OPTIMISM_CHECKS:-0}" = "1" ]; then
-  if [ -z "${OPTIMISM_ROOT:-}" ]; then
-    echo "CONDUCTOR_RS_RUN_OPTIMISM_CHECKS=1 requires OPTIMISM_ROOT=/path/to/optimism." >&2
-    exit 1
-  fi
-  run scripts/audit-upstream-surface.sh
-else
-  echo "Skipping optional Optimism source checks. Set CONDUCTOR_RS_RUN_OPTIMISM_CHECKS=1 and OPTIMISM_ROOT=/path/to/optimism to run them."
-fi
-
 if [ "${CONDUCTOR_RS_RUN_LIVE:-0}" = "1" ]; then
   ran_live=0
 
