@@ -90,24 +90,35 @@ and `nc`.
 
 ## Production Readiness Check
 
-Run the local compatibility suite, lint gate, container build smoke test, and
-the focused patched-Kona tests from `~/rust/optimism` with:
+Run the local compatibility suite, lint gate, and container build smoke test
+with:
 
 ```sh
 scripts/verify-production-readiness.sh
 ```
 
-Set `OPTIMISM_ROOT=/path/to/optimism` if the patched Kona checkout is not at
-`~/rust/optimism`. To include live endpoint conformance, set
+The default readiness check is self-contained in this repository. It does not
+require an Optimism checkout, submodule, or workspace-specific path.
+
+Optional upstream conformance checks can compare this implementation against a
+local Optimism checkout. This is developer tooling, not a runtime or build
+dependency:
+
+```sh
+CONDUCTOR_RS_RUN_OPTIMISM_CHECKS=1 \
+  OPTIMISM_ROOT=/path/to/optimism \
+  scripts/verify-production-readiness.sh
+```
+
+To include live endpoint conformance, set
 `CONDUCTOR_RS_RUN_LIVE=1` with the relevant `CONDUCTOR_RS_LIVE_*` variables
 from the live validation section below.
 
-The readiness script first runs `scripts/audit-upstream-surface.sh`, which
-derives the upstream `op-conductor` JSON-RPC methods, CLI flags, and flag env
-vars from the current Optimism checkout and fails if the Rust binary/server no
-longer exposes that surface. It also runs
-`scripts/audit-kona-conductor-contract.sh`, which checks the patched Kona admin
-and sequencing contract that `op-conductor` depends on.
+When enabled, `scripts/audit-upstream-surface.sh` derives the upstream
+`op-conductor` JSON-RPC methods, CLI flags, and flag env vars from
+`OPTIMISM_ROOT` and fails if the Rust binary/server no longer exposes that
+surface. It also runs `scripts/audit-kona-conductor-contract.sh`, which checks
+the patched Kona admin and sequencing contract that `op-conductor` depends on.
 
 The patched-Kona slice covers the HA-critical admin and sequencing invariants:
 hash-gated `admin_startSequencer`, unsafe-payload validation, remote

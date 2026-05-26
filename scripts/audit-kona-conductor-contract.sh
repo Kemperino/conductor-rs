@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OPTIMISM_ROOT="${OPTIMISM_ROOT:-$HOME/rust/optimism}"
+
+if [ -z "${OPTIMISM_ROOT:-}" ]; then
+  echo "OPTIMISM_ROOT must point to a Kona checkout for conductor contract auditing." >&2
+  exit 1
+fi
 
 require_file() {
   if [ ! -f "$1" ]; then

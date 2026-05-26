@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OPTIMISM_ROOT="${OPTIMISM_ROOT:-$HOME/rust/optimism}"
 IMAGE_TAG="${CONDUCTOR_RS_IMAGE_TAG:-conductor-rs:local}"
 
 run() {
@@ -14,8 +13,6 @@ run() {
 
 cd "$ROOT"
 
-run scripts/audit-upstream-surface.sh
-run scripts/audit-kona-conductor-contract.sh
 run cargo fmt --check
 run cargo test
 run cargo clippy --all-targets --all-features -- -D warnings
@@ -29,11 +26,17 @@ else
   echo "Skipping Docker image check because docker is not on PATH."
 fi
 
-if [ -f "$OPTIMISM_ROOT/rust/Cargo.toml" ]; then
+if [ "${CONDUCTOR_RS_RUN_OPTIMISM_CHECKS:-0}" = "1" ]; then
+  if [ -z "${OPTIMISM_ROOT:-}" ]; then
+    echo "CONDUCTOR_RS_RUN_OPTIMISM_CHECKS=1 requires OPTIMISM_ROOT=/path/to/optimism." >&2
+    exit 1
+  fi
+  run scripts/audit-upstream-surface.sh
+  run scripts/audit-kona-conductor-contract.sh
   run cargo test --manifest-path "$OPTIMISM_ROOT/rust/Cargo.toml" -p kona-rpc -- --nocapture
   run cargo test --manifest-path "$OPTIMISM_ROOT/rust/Cargo.toml" -p kona-node-service -- --nocapture
 else
-  echo "Skipping patched Kona checks because OPTIMISM_ROOT does not contain rust/Cargo.toml: $OPTIMISM_ROOT"
+  echo "Skipping optional Optimism source checks. Set CONDUCTOR_RS_RUN_OPTIMISM_CHECKS=1 and OPTIMISM_ROOT=/path/to/optimism to run them."
 fi
 
 if [ "${CONDUCTOR_RS_RUN_LIVE:-0}" = "1" ]; then
