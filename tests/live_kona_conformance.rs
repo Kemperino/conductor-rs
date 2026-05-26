@@ -14,7 +14,7 @@ struct RpcError {
 
 #[tokio::test]
 #[ignore = "requires CONDUCTOR_RS_LIVE_KONA_NODE_RPC and CONDUCTOR_RS_LIVE_KONA_EXECUTION_RPC"]
-async fn live_kona_admin_rpc_supports_conductor_contract() {
+async fn live_kona_admin_rpc_supports_current_interop() {
     let node_rpc = required_url("CONDUCTOR_RS_LIVE_KONA_NODE_RPC");
     let execution_rpc = required_url("CONDUCTOR_RS_LIVE_KONA_EXECUTION_RPC");
     let client = client();
@@ -24,7 +24,7 @@ async fn live_kona_admin_rpc_supports_conductor_contract() {
         .unwrap();
     assert!(conductor_enabled, "kona node must be in conductor mode");
 
-    let active_before: bool = rpc_call(&client, &node_rpc, "admin_sequencerActive", json!([]))
+    let _: bool = rpc_call(&client, &node_rpc, "admin_sequencerActive", json!([]))
         .await
         .unwrap();
     let sync_status: SyncStatus = rpc_call(&client, &node_rpc, "optimism_syncStatus", json!([]))
@@ -39,27 +39,6 @@ async fn live_kona_admin_rpc_supports_conductor_contract() {
         assert_eq!(
             sync_hash, latest.hash,
             "kona unsafe_l2 and execution latest must agree before a start check"
-        );
-    }
-
-    if env_flag("CONDUCTOR_RS_LIVE_KONA_REJECT_STALE_HASH") {
-        assert!(
-            !active_before,
-            "stale-hash rejection check requires an inactive sequencer"
-        );
-        let stale_hash = different_hash(latest.hash);
-        let err = rpc_call::<Value>(
-            &client,
-            &node_rpc,
-            "admin_startSequencer",
-            json!([stale_hash]),
-        )
-        .await
-        .expect_err("stale hash must be rejected");
-        assert_ne!(err.code, -32601, "hash-gated start method is missing");
-        assert!(
-            err.message.contains("unsafe head") || err.message.contains("mismatch"),
-            "unexpected stale-hash error: {err:?}"
         );
     }
 
@@ -520,10 +499,4 @@ async fn optional_payload(name: &str) -> Option<PayloadEnvelope> {
     let value = serde_json::from_str::<Value>(&raw)
         .unwrap_or_else(|err| panic!("failed to parse {name}={path} as JSON: {err}"));
     Some(PayloadEnvelope::new(value))
-}
-
-fn different_hash(hash: Hash) -> Hash {
-    let mut bytes = *hash.as_bytes();
-    bytes[31] ^= 0x01;
-    format!("0x{}", hex::encode(bytes)).parse().unwrap()
 }

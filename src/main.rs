@@ -504,7 +504,6 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     init_tracing(&args);
     warn_unknown_env_vars();
-    log_parsed_compatibility_flags(&args);
     validate_args(&args)?;
     let healthcheck_interval = args
         .healthcheck_interval
@@ -616,9 +615,6 @@ async fn main() -> anyhow::Result<()> {
     };
     let pprof_file_profiler =
         start_pprof_file_profiler(args.pprof_type, args.pprof_path.as_deref())?;
-    if args.rpc_enable_admin {
-        tracing::debug!("rpc.enable-admin is accepted for upstream CLI compatibility");
-    }
 
     tracing::info!(addr = %rpc_addr, "starting conductor-rs rpc server");
     tracing::info!(addr = %consensus_bound_addr, "starting conductor-rs raft transport");
@@ -691,33 +687,6 @@ fn init_tracing(args: &Args) {
                 .with(tracing_subscriber::fmt::layer().with_ansi(args.log_color))
                 .init();
         }
-    }
-}
-
-fn log_parsed_compatibility_flags(args: &Args) {
-    let rollup_flags_set = args.network.is_some()
-        || args.rollup_config.is_some()
-        || args.override_canyon.is_some()
-        || args.override_delta.is_some()
-        || args.override_ecotone.is_some()
-        || args.override_fjord.is_some()
-        || args.override_granite.is_some()
-        || args.override_holocene.is_some()
-        || args.override_isthmus.is_some()
-        || args.override_jovian.is_some()
-        || args.override_karst.is_some()
-        || args.override_interop.is_some()
-        || args.override_pectrablobschedule.is_some();
-    if rollup_flags_set {
-        tracing::debug!("rollup config flags parsed for upstream CLI compatibility");
-    }
-
-    if args.pprof_enabled || args.pprof_path.is_some() || args.pprof_type.is_some() {
-        tracing::debug!(
-            addr = %args.pprof_addr,
-            port = args.pprof_port,
-            "pprof flags parsed for upstream CLI compatibility"
-        );
     }
 }
 
