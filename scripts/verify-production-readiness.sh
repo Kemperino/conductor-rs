@@ -32,9 +32,6 @@ if [ "${CONDUCTOR_RS_RUN_OPTIMISM_CHECKS:-0}" = "1" ]; then
     exit 1
   fi
   run scripts/audit-upstream-surface.sh
-  run scripts/audit-kona-conductor-contract.sh
-  run cargo test --manifest-path "$OPTIMISM_ROOT/rust/Cargo.toml" -p kona-rpc -- --nocapture
-  run cargo test --manifest-path "$OPTIMISM_ROOT/rust/Cargo.toml" -p kona-node-service -- --nocapture
 else
   echo "Skipping optional Optimism source checks. Set CONDUCTOR_RS_RUN_OPTIMISM_CHECKS=1 and OPTIMISM_ROOT=/path/to/optimism to run them."
 fi
@@ -44,7 +41,7 @@ if [ "${CONDUCTOR_RS_RUN_LIVE:-0}" = "1" ]; then
 
   if [ -n "${CONDUCTOR_RS_LIVE_KONA_NODE_RPC:-}" ] && [ -n "${CONDUCTOR_RS_LIVE_KONA_EXECUTION_RPC:-}" ]; then
     run cargo test --test live_kona_conformance \
-      live_kona_admin_rpc_supports_conductor_contract -- --ignored --nocapture
+      live_kona_admin_rpc_supports_current_interop -- --ignored --nocapture
     ran_live=1
   fi
 

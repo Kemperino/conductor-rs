@@ -37,16 +37,16 @@ interop:
 ## Compatibility notes
 
 `op-conductor` starts a sequencer with `admin_startSequencer(hash)`.
-`conductor-rs` defaults to that hash-gated shape. The matching Kona patch in
-`~/rust/optimism` accepts the hash and rejects stale unsafe heads before
-starting. In explicit `--sequencer.start-mode=auto`, `conductor-rs` can still
-fall back for older Kona builds: if the node rejects the hash argument with
-`invalid params`, it verifies the local unsafe head against the committed
-conductor unsafe head before making the parameterless call.
+`conductor-rs` defaults to that same hash-parameter shape, and current Kona
+accepts it even though it does not enforce the hash today. In explicit
+`--sequencer.start-mode=auto`, `conductor-rs` can still fall back for older Kona
+builds: if the node rejects the hash argument with `invalid params`, it verifies
+the local unsafe head against the committed conductor unsafe head before making
+the parameterless call.
 
 That fallback keeps stale candidates from starting under normal operation, but
-the check and start are not atomic unless the node itself accepts the expected
-unsafe-head hash. Prefer the patched Kona admin RPC contract for HA deployments.
+the check and start are not atomic unless the node itself validates the expected
+unsafe-head hash.
 
 ## Run
 
@@ -117,13 +117,7 @@ from the live validation section below.
 When enabled, `scripts/audit-upstream-surface.sh` derives the upstream
 `op-conductor` JSON-RPC methods, CLI flags, and flag env vars from
 `OPTIMISM_ROOT` and fails if the Rust binary/server no longer exposes that
-surface. It also runs `scripts/audit-kona-conductor-contract.sh`, which checks
-the patched Kona admin and sequencing contract that `op-conductor` depends on.
-
-The patched-Kona slice covers the HA-critical admin and sequencing invariants:
-hash-gated `admin_startSequencer`, unsafe-payload validation, remote
-`conductor_overrideLeader(true)` propagation, start-time unsafe-head checks, and
-fail-closed block gossip when `conductor_commitUnsafePayload` fails.
+surface.
 
 Start exactly one node with `--raft.bootstrap` to create the initial cluster.
 Bring up additional nodes without bootstrap, then call
@@ -200,21 +194,20 @@ The conductor RPC server also exposes `GET /healthz` and JSON-RPC
 
 The default test suite uses deterministic fake Kona endpoints so it can run
 locally without a full OP Stack devnet. Real HA readiness still needs a live
-patched Kona topology check. The ignored integration tests in
-`tests/live_kona_conformance.rs` provide that gate:
+Kona/conductor topology check. The ignored integration tests in
+`tests/live_kona_conformance.rs` provide optional live gates:
 
 ```sh
 CONDUCTOR_RS_LIVE_KONA_NODE_RPC=http://127.0.0.1:9545 \
 CONDUCTOR_RS_LIVE_KONA_EXECUTION_RPC=http://127.0.0.1:8545 \
 cargo test --test live_kona_conformance \
-  live_kona_admin_rpc_supports_conductor_contract -- --ignored
+  live_kona_admin_rpc_supports_current_interop -- --ignored
 ```
 
 That read-only check verifies `admin_conductorEnabled`,
 `admin_sequencerActive`, `optimism_syncStatus`, `opp2p_peerStats`, and the
-execution latest-head lookup used by the conductor. On an isolated devnet, set
-`CONDUCTOR_RS_LIVE_KONA_REJECT_STALE_HASH=1` to prove stale hash-gated starts
-are rejected. To prove unsafe-head repair against a real Kona node, set
+execution latest-head lookup used by the conductor. To prove unsafe-head repair
+against a real Kona node, set
 `CONDUCTOR_RS_LIVE_KONA_UNSAFE_PAYLOAD_FILE=/path/to/payload.json`; the file
 must contain the `ExecutionPayloadEnvelope` JSON passed to
 `admin_postUnsafePayload`, and the test verifies the execution latest head after
