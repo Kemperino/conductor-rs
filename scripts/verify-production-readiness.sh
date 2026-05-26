@@ -30,10 +30,8 @@ else
 fi
 
 if [ -f "$OPTIMISM_ROOT/rust/Cargo.toml" ]; then
-  run cargo test --manifest-path "$OPTIMISM_ROOT/rust/Cargo.toml" -p kona-rpc admin_ -- --nocapture
-  run cargo test --manifest-path "$OPTIMISM_ROOT/rust/Cargo.toml" -p kona-node-service test_seal_and_commit -- --nocapture
-  run cargo test --manifest-path "$OPTIMISM_ROOT/rust/Cargo.toml" -p kona-node-service test_override_leader -- --nocapture
-  run cargo test --manifest-path "$OPTIMISM_ROOT/rust/Cargo.toml" -p kona-node-service test_start_sequencer -- --nocapture
+  run cargo test --manifest-path "$OPTIMISM_ROOT/rust/Cargo.toml" -p kona-rpc -- --nocapture
+  run cargo test --manifest-path "$OPTIMISM_ROOT/rust/Cargo.toml" -p kona-node-service -- --nocapture
 else
   echo "Skipping patched Kona checks because OPTIMISM_ROOT does not contain rust/Cargo.toml: $OPTIMISM_ROOT"
 fi

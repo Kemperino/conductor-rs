@@ -266,6 +266,11 @@ async fn run_upstream_listener(
             break;
         }
 
+        if upstream.is_none() && !is_leader() {
+            sleep_or_shutdown(LEADER_POLL_INTERVAL, &mut shutdown).await;
+            continue;
+        }
+
         if upstream.is_none() {
             match dial_upstream(&rollup_boost_ws_url).await {
                 Ok(stream) => {
@@ -430,6 +435,7 @@ impl Hub {
 mod tests {
     use super::*;
     use axum::extract::ws::WebSocketUpgrade;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::Notify;
 
     #[tokio::test]
@@ -517,6 +523,56 @@ mod tests {
         let no_message = tokio::time::timeout(Duration::from_millis(250), downstream.next()).await;
         assert!(no_message.is_err());
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_waits_until_leader_like_upstream() {
+        let connections = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/ws", get(counting_upstream_ws))
+            .with_state(connections.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let metrics = Arc::new(ConductorMetrics::new("test"));
+        let hub = Hub::new(metrics.clone());
+        let is_leader = Arc::new(AtomicBool::new(false));
+        let leader_fn = {
+            let is_leader = is_leader.clone();
+            Arc::new(move || is_leader.load(Ordering::SeqCst))
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = tokio::spawn(run_upstream_listener(
+            format!("ws://{addr}/ws").parse().unwrap(),
+            None,
+            hub,
+            metrics,
+            leader_fn,
+            Duration::from_millis(10),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(connections.load(Ordering::SeqCst), 0);
+
+        is_leader.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if connections.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let _ = shutdown_tx.send(true);
+        listener.await.unwrap();
+        server.abort();
     }
 
     #[tokio::test]
@@ -618,6 +674,16 @@ mod tests {
                 Duration::from_millis(20),
                 Duration::from_millis(50),
             )
+        })
+    }
+
+    async fn counting_upstream_ws(
+        ws: WebSocketUpgrade,
+        State(connections): State<Arc<AtomicUsize>>,
+    ) -> impl IntoResponse {
+        ws.on_upgrade(move |mut socket| async move {
+            connections.fetch_add(1, Ordering::SeqCst);
+            while socket.next().await.is_some() {}
         })
     }
 

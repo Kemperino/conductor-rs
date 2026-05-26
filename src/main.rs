@@ -119,9 +119,10 @@ struct Args {
     #[arg(
         long = "consensus.port",
         env = "OP_CONDUCTOR_CONSENSUS_PORT",
-        default_value_t = 50050
+        default_value_t = 50050,
+        allow_negative_numbers = true
     )]
-    consensus_port: u16,
+    consensus_port: i64,
     #[arg(
         long = "consensus.advertised",
         env = "OP_CONDUCTOR_CONSENSUS_ADVERTISED"
@@ -169,9 +170,10 @@ struct Args {
     #[arg(
         long = "rpc.port",
         env = "OP_CONDUCTOR_RPC_PORT",
-        default_value_t = 8545
+        default_value_t = 8545,
+        allow_negative_numbers = true
     )]
-    rpc_port: u16,
+    rpc_port: i64,
     #[arg(
         long = "rpc.enable-admin",
         env = "OP_CONDUCTOR_RPC_ENABLE_ADMIN",
@@ -211,9 +213,10 @@ struct Args {
     #[arg(
         long = "metrics.port",
         env = "OP_CONDUCTOR_METRICS_PORT",
-        default_value_t = 7300
+        default_value_t = 7300,
+        allow_negative_numbers = true
     )]
-    metrics_port: u16,
+    metrics_port: i64,
     #[arg(
         long = "pprof.enabled",
         env = "OP_CONDUCTOR_PPROF_ENABLED",
@@ -233,9 +236,10 @@ struct Args {
     #[arg(
         long = "pprof.port",
         env = "OP_CONDUCTOR_PPROF_PORT",
-        default_value_t = 6060
+        default_value_t = 6060,
+        allow_negative_numbers = true
     )]
-    pprof_port: u16,
+    pprof_port: i64,
     #[arg(long = "pprof.path", env = "OP_CONDUCTOR_PPROF_PATH")]
     pprof_path: Option<PathBuf>,
     #[arg(long = "pprof.type", env = "OP_CONDUCTOR_PPROF_TYPE")]
@@ -245,9 +249,10 @@ struct Args {
     #[arg(
         long = "websocket.server-port",
         env = "OP_CONDUCTOR_WEBSOCKET_SERVER_PORT",
-        default_value_t = 8546
+        default_value_t = 8546,
+        allow_negative_numbers = true
     )]
-    websocket_server_port: u16,
+    websocket_server_port: i64,
     #[arg(
         long = "paused",
         env = "OP_CONDUCTOR_PAUSED",
@@ -530,7 +535,7 @@ async fn main() -> anyhow::Result<()> {
     let rollupboost_ws_url =
         parse_optional_url(args.rollupboost_ws_url.as_deref(), "rollupboost.ws-url")?;
     let rollup_boost_health = rollup_boost_health_config(&args)?;
-    let consensus_listen_addr = listen_addr(&args.consensus_addr, args.consensus_port)
+    let consensus_listen_addr = listen_addr(&args.consensus_addr, rpc_port(args.consensus_port)?)
         .context("parsing consensus listen address")?;
     let consensus_listener = TcpListener::bind(consensus_listen_addr)
         .await
@@ -540,8 +545,8 @@ async fn main() -> anyhow::Result<()> {
         .context("reading consensus bound address")?;
     let consensus_advertised = optional_string(args.consensus_advertised.as_deref())
         .unwrap_or_else(|| consensus_bound_addr.to_string());
-    let rpc_addr =
-        listen_addr(&args.rpc_addr, args.rpc_port).context("parsing rpc listen address")?;
+    let rpc_addr = listen_addr(&args.rpc_addr, rpc_port(args.rpc_port)?)
+        .context("parsing rpc listen address")?;
     let raft_heartbeat_interval =
         std::cmp::max(args.raft_heartbeat_timeout / 3, Duration::from_millis(1));
     let consensus = RaftConsensus::new_http(RaftConsensusConfig {
@@ -587,12 +592,24 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to initialize sequencer active status")?;
     let metrics = conductor.metrics();
-    let metrics_addr = listen_addr(&args.metrics_addr, args.metrics_port)
-        .context("parsing metrics listen address")?;
+    let metrics_addr = if args.metrics_enabled {
+        Some(
+            listen_addr(
+                &args.metrics_addr,
+                observability_port(args.metrics_port, "metrics")?,
+            )
+            .context("parsing metrics listen address")?,
+        )
+    } else {
+        None
+    };
     let pprof_addr = if args.pprof_enabled {
         Some(
-            listen_addr(&args.pprof_addr, args.pprof_port)
-                .context("parsing pprof listen address")?,
+            listen_addr(
+                &args.pprof_addr,
+                observability_port(args.pprof_port, "pprof")?,
+            )
+            .context("parsing pprof listen address")?,
         )
     } else {
         None
@@ -617,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
     let runtime_result: anyhow::Result<()> = tokio::select! {
         result = conductor_rs::rpc::serve_with_proxy(conductor.clone(), rpc_addr, proxy_config) => result.context("rpc server exited").map(|_| ()),
         result = serve_raft_transport_on_listener(consensus_for_transport, consensus_listener) => result.context("raft transport exited"),
-        result = run_metrics_server(metrics, metrics_addr, args.metrics_enabled, conductor_for_metrics) => result.context("metrics server exited"),
+        result = run_metrics_server(metrics, metrics_addr, conductor_for_metrics) => result.context("metrics server exited"),
         result = run_pprof_server(pprof_addr, conductor_for_pprof) => result.context("pprof server exited"),
         result = run_flashblocks_server(rollupboost_ws_url, args.websocket_server_port, conductor.clone()) => result.context("flashblocks websocket server exited"),
         result = run_leader_watch(consensus_for_leader_watch, conductor.clone()) => result.context("leader watch exited"),
@@ -757,6 +774,8 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     if args.consensus_addr.is_empty() {
         anyhow::bail!("missing consensus address");
     }
+    rpc_port(args.consensus_port)?;
+    rpc_port(args.rpc_port)?;
     if args.server_id.is_empty() {
         anyhow::bail!("missing raft server ID");
     }
@@ -807,7 +826,37 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
             "only one of RollupBoostPartialHealthinessToleranceLimit or RollupBoostPartialHealthinessToleranceIntervalSeconds found to be defined. Either define both of them or none."
         );
     }
+    if args.metrics_enabled {
+        observability_port(args.metrics_port, "metrics")?;
+    }
+    if args.pprof_enabled {
+        observability_port(args.pprof_port, "pprof")?;
+    }
+    if optional_string(args.rollupboost_ws_url.as_deref()).is_some() {
+        websocket_server_port(args.websocket_server_port)?;
+    }
     Ok(())
+}
+
+fn rpc_port(port: i64) -> anyhow::Result<u16> {
+    if !(0..=u16::MAX as i64).contains(&port) {
+        anyhow::bail!("invalid RPC port");
+    }
+    Ok(port as u16)
+}
+
+fn observability_port(port: i64, name: &'static str) -> anyhow::Result<u16> {
+    if !(0..=u16::MAX as i64).contains(&port) {
+        anyhow::bail!("invalid {name} port");
+    }
+    Ok(port as u16)
+}
+
+fn websocket_server_port(port: i64) -> anyhow::Result<u16> {
+    if !(0..=u16::MAX as i64).contains(&port) {
+        anyhow::bail!("WebSocket server port invalid: {port}");
+    }
+    Ok(port as u16)
 }
 
 fn execution_p2p_health_config(args: &Args) -> anyhow::Result<Option<ExecutionP2pHealthConfig>> {
@@ -1228,15 +1277,14 @@ where
 
 async fn run_metrics_server<C, S>(
     metrics: std::sync::Arc<conductor_rs::ConductorMetrics>,
-    addr: SocketAddr,
-    enabled: bool,
+    addr: Option<SocketAddr>,
     conductor: std::sync::Arc<Conductor<C, S>>,
 ) -> anyhow::Result<()>
 where
     C: conductor_rs::Consensus + 'static,
     S: conductor_rs::sequencer::SequencerControl + 'static,
 {
-    if enabled {
+    if let Some(addr) = addr {
         tracing::info!(addr = %addr, "starting conductor-rs metrics server");
         serve_metrics_with_shutdown(metrics, addr, async move {
             conductor.wait_stopped().await;
@@ -1270,7 +1318,7 @@ where
 
 async fn run_flashblocks_server<C, S>(
     rollupboost_ws_url: Option<Url>,
-    websocket_server_port: u16,
+    websocket_server_port_raw: i64,
     conductor: std::sync::Arc<Conductor<C, S>>,
 ) -> anyhow::Result<()>
 where
@@ -1281,7 +1329,10 @@ where
         std::future::pending::<()>().await;
         return Ok(());
     };
-    let listen_addr = SocketAddr::from(([0, 0, 0, 0], websocket_server_port));
+    let listen_addr = SocketAddr::from((
+        [0, 0, 0, 0],
+        websocket_server_port(websocket_server_port_raw)?,
+    ));
     let metrics = conductor.metrics();
     let leader_conductor = conductor.clone();
     tracing::info!(addr = %listen_addr, upstream = %rollup_boost_ws_url, "starting flashblocks websocket server");
@@ -1515,7 +1566,7 @@ mod tests {
         assert_eq!(parsed.pprof_port, 6061);
         assert_eq!(parsed.pprof_type, Some(PprofProfile::Heap));
         assert_eq!(
-            listen_addr(&parsed.rpc_addr, parsed.rpc_port).unwrap(),
+            listen_addr(&parsed.rpc_addr, rpc_port(parsed.rpc_port).unwrap()).unwrap(),
             "127.0.0.1:9555".parse::<SocketAddr>().unwrap()
         );
     }
@@ -1786,6 +1837,82 @@ mod tests {
     }
 
     #[test]
+    fn disabled_observability_servers_ignore_unused_invalid_ports_like_upstream() {
+        let mut args = required_args();
+        args.extend([
+            "--metrics.addr",
+            "not a resolvable host @",
+            "--metrics.port",
+            "-1",
+            "--pprof.port",
+            "70000",
+        ]);
+        let parsed = Args::try_parse_from(args).unwrap();
+
+        validate_args(&parsed).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_enabled_metrics_invalid_port_like_upstream() {
+        let mut args = required_args();
+        args.extend(["--metrics.enabled", "--metrics.port", "70000"]);
+        let parsed = Args::try_parse_from(args).unwrap();
+
+        let err = validate_args(&parsed).unwrap_err();
+
+        assert_eq!(err.to_string(), "invalid metrics port");
+    }
+
+    #[test]
+    fn validation_rejects_enabled_pprof_invalid_port_like_upstream() {
+        let mut args = required_args();
+        args.extend(["--pprof.enabled", "--pprof.port", "-1"]);
+        let parsed = Args::try_parse_from(args).unwrap();
+
+        let err = validate_args(&parsed).unwrap_err();
+
+        assert_eq!(err.to_string(), "invalid pprof port");
+    }
+
+    #[test]
+    fn validation_rejects_invalid_rpc_ports_like_upstream() {
+        for flag in ["--rpc.port", "--consensus.port"] {
+            let mut args = required_args();
+            args.extend([flag, "-1"]);
+            let parsed = Args::try_parse_from(args).unwrap();
+
+            let err = validate_args(&parsed).unwrap_err();
+
+            assert_eq!(err.to_string(), "invalid RPC port");
+        }
+    }
+
+    #[test]
+    fn disabled_flashblocks_ignores_unused_invalid_websocket_port_like_upstream() {
+        let mut args = required_args();
+        args.extend(["--websocket.server-port", "-1"]);
+        let parsed = Args::try_parse_from(args).unwrap();
+
+        validate_args(&parsed).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_enabled_flashblocks_invalid_websocket_port_like_upstream() {
+        let mut args = required_args();
+        args.extend([
+            "--rollupboost.ws-url",
+            "ws://127.0.0.1:8080",
+            "--websocket.server-port",
+            "-1",
+        ]);
+        let parsed = Args::try_parse_from(args).unwrap();
+
+        let err = validate_args(&parsed).unwrap_err();
+
+        assert_eq!(err.to_string(), "WebSocket server port invalid: -1");
+    }
+
+    #[test]
     fn rpc_addr_accepts_legacy_host_port_value() {
         let mut args = required_args();
         args.extend(["--rpc.addr", "127.0.0.1:9547", "--rpc.port", "9548"]);
@@ -1793,7 +1920,7 @@ mod tests {
         let parsed = Args::try_parse_from(args).unwrap();
 
         assert_eq!(
-            listen_addr(&parsed.rpc_addr, parsed.rpc_port).unwrap(),
+            listen_addr(&parsed.rpc_addr, rpc_port(parsed.rpc_port).unwrap()).unwrap(),
             "127.0.0.1:9547".parse::<SocketAddr>().unwrap()
         );
     }
@@ -2589,6 +2716,24 @@ mod tests {
         let cfg = execution_p2p_health_config(&parsed).unwrap().unwrap();
 
         assert_eq!(cfg.rpc, parsed.execution_rpc);
+    }
+
+    #[test]
+    fn validation_accepts_enabled_el_p2p_with_rpc_like_upstream() {
+        let mut args = required_args();
+        args.extend([
+            "--healthcheck.execution-p2p-enabled",
+            "--healthcheck.execution-p2p-min-peer-count",
+            "1",
+            "--healthcheck.execution-p2p-rpc-url",
+            "http://127.0.0.1:8551",
+        ]);
+        let parsed = Args::try_parse_from(args).unwrap();
+
+        validate_args(&parsed).unwrap();
+        let cfg = execution_p2p_health_config(&parsed).unwrap().unwrap();
+
+        assert_eq!(cfg.rpc.as_str(), "http://127.0.0.1:8551/");
     }
 
     #[test]

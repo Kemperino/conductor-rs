@@ -1,4 +1,5 @@
 use conductor_rs::{types::PeerStats, types::SyncStatus, Hash, PayloadEnvelope};
+use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, Url};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -162,6 +163,7 @@ async fn live_conductor_cluster_exposes_upstream_ha_contract() {
             healthz.get("version").is_some(),
             "{conductor} /healthz should expose version"
         );
+        assert_live_main_rpc_websocket(conductor).await;
 
         let _: String = rpc_call(&client, conductor, "health_status", json!([]))
             .await
@@ -221,6 +223,30 @@ async fn live_conductor_cluster_exposes_upstream_ha_contract() {
             .unwrap();
         let leader_after = wait_for_new_leader(&client, &conductors, &leader_before).await;
         assert_ne!(leader_before, leader_after);
+    }
+
+    if env_flag("CONDUCTOR_RS_LIVE_PROXY_CHECK") {
+        assert_live_proxy_surface(&client, leader_url).await;
+        for (index, conductor) in conductors.iter().enumerate() {
+            if index == leader_indexes[0] {
+                continue;
+            }
+            for (method, params) in [
+                ("eth_getBlockByNumber", json!(["latest", false])),
+                ("optimism_syncStatus", json!([])),
+            ] {
+                let err = rpc_call::<Value>(&client, conductor, method, params)
+                    .await
+                    .expect_err(
+                        "{method} follower proxy calls must be rejected after backend lookup",
+                    );
+                assert_eq!(err.code, -32000, "{conductor} {method} returned {err:?}");
+                assert!(
+                    err.message.contains("non-leader"),
+                    "{conductor} {method} returned unexpected follower proxy error: {err:?}"
+                );
+            }
+        }
     }
 }
 
@@ -295,6 +321,111 @@ async fn wait_for_new_leader(client: &Client, conductors: &[Url], old: &str) -> 
         );
         sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn assert_live_proxy_surface(client: &Client, leader_url: &Url) {
+    let latest: Value = rpc_call(
+        client,
+        leader_url,
+        "eth_getBlockByNumber",
+        json!(["latest", false]),
+    )
+    .await
+    .unwrap();
+    assert!(
+        latest.get("hash").and_then(Value::as_str).is_some(),
+        "leader eth_getBlockByNumber should return a block hash: {latest}"
+    );
+    assert!(
+        latest.get("number").and_then(Value::as_str).is_some(),
+        "leader eth_getBlockByNumber should return a block number: {latest}"
+    );
+    let latest_number = latest
+        .get("number")
+        .and_then(Value::as_str)
+        .and_then(|raw| raw.strip_prefix("0x"))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .expect("leader eth_getBlockByNumber should return a parseable block number");
+
+    let _: SyncStatus = rpc_call(client, leader_url, "optimism_syncStatus", json!([]))
+        .await
+        .unwrap();
+    let output: Value = rpc_call(
+        client,
+        leader_url,
+        "optimism_outputAtBlock",
+        json!([format!("0x{latest_number:x}")]),
+    )
+    .await
+    .unwrap();
+    assert!(
+        output.get("outputRoot").is_some() || output.get("blockRef").is_some(),
+        "leader optimism_outputAtBlock response should look like an output response: {output}"
+    );
+
+    let rollup_config: Value = rpc_call(client, leader_url, "optimism_rollupConfig", json!([]))
+        .await
+        .unwrap();
+    assert!(
+        rollup_config.get("genesis").is_some()
+            || rollup_config.get("l2_chain_id").is_some()
+            || rollup_config.get("l2ChainID").is_some(),
+        "leader optimism_rollupConfig response should look like a rollup config: {rollup_config}"
+    );
+
+    let _: bool = rpc_call(client, leader_url, "admin_sequencerActive", json!([]))
+        .await
+        .unwrap();
+}
+
+async fn assert_live_main_rpc_websocket(conductor: &Url) {
+    for path in ["/", "/ws", "/ws/"] {
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(websocket_url(conductor, path).to_string())
+                .await
+                .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"jsonrpc":"2.0","id":1,"method":"conductor_leader","params":[]}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let response = ws.next().await.unwrap().unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(text) = response else {
+            panic!("{conductor}{path} expected websocket text response, got {response:?}");
+        };
+        let payload: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            payload.get("jsonrpc").and_then(Value::as_str),
+            Some("2.0"),
+            "{conductor}{path} websocket JSON-RPC version"
+        );
+        assert_eq!(
+            payload.get("id").and_then(Value::as_i64),
+            Some(1),
+            "{conductor}{path} websocket JSON-RPC id"
+        );
+        assert!(
+            payload.get("result").and_then(Value::as_bool).is_some(),
+            "{conductor}{path} websocket conductor_leader response should contain bool result: {payload}"
+        );
+    }
+}
+
+fn websocket_url(base: &Url, path: &str) -> Url {
+    let mut url = base.clone();
+    let scheme = match base.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        "ws" => "ws",
+        "wss" => "wss",
+        other => panic!("cannot derive websocket URL from {other} scheme in {base}"),
+    };
+    url.set_scheme(scheme).unwrap();
+    url.set_path(path);
+    url.set_query(None);
+    url.set_fragment(None);
+    url
 }
 
 async fn leader_id(client: &Client, conductor: &Url) -> String {

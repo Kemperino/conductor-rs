@@ -105,7 +105,7 @@ impl RollupBoostHealthClient {
             .send()
             .await?;
         let status = response.status();
-        drain_body(response).await?;
+        let _ = drain_body(response).await;
 
         match status {
             StatusCode::OK => Ok(RollupBoostHealthStatus::Healthy),
@@ -127,7 +127,8 @@ impl RollupBoostHealthClient {
         }
 
         let body = read_limited_body(response).await?;
-        let payload = serde_json::from_slice::<RollupBoostNextHealthResponse>(&body)
+        let mut decoder = serde_json::Deserializer::from_slice(&body);
+        let payload = RollupBoostNextHealthResponse::deserialize(&mut decoder)
             .map_err(|err| RollupBoostHealthError::InvalidResponse(err.to_string()))?;
 
         match payload.rollup_boost_health.as_str() {
@@ -217,7 +218,7 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::sync::Arc;
-    use tokio::net::TcpListener;
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
 
     async fn server(
         status: StatusCode,
@@ -267,6 +268,24 @@ mod tests {
         (url, handle)
     }
 
+    async fn broken_chunked_server(status: StatusCode) -> (Url, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse::<Url>()
+            .unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let reason = status.canonical_reason().unwrap_or("status");
+            let response = format!(
+                "HTTP/1.1 {} {}\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\nzz\r\nbroken",
+                status.as_u16(),
+                reason
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (url, handle)
+    }
+
     async fn rpc_server(result: Value) -> (Url, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap())
@@ -286,6 +305,19 @@ mod tests {
     #[tokio::test]
     async fn status_code_health_maps_partial_content() {
         let (url, _handle) = server(StatusCode::PARTIAL_CONTENT, json!(null), "/healthz").await;
+        let client = RollupBoostHealthClient::new(RollupBoostHealthConfig::StatusCode {
+            base_url: url,
+            timeout: Duration::from_secs(1),
+        });
+
+        let status = client.check().await.unwrap();
+
+        assert_eq!(status, RollupBoostHealthStatus::Partial);
+    }
+
+    #[tokio::test]
+    async fn status_code_health_uses_status_when_body_drain_fails_like_upstream() {
+        let (url, _handle) = broken_chunked_server(StatusCode::PARTIAL_CONTENT).await;
         let client = RollupBoostHealthClient::new(RollupBoostHealthConfig::StatusCode {
             base_url: url,
             timeout: Duration::from_secs(1),
@@ -341,6 +373,20 @@ mod tests {
         let mut body = r#"{"version":"v1","rollup_boost_health":"Healthy"}"#.to_string();
         body.push_str(&" ".repeat(MAX_HEALTH_RESPONSE_BYTES + 16));
         let (url, _handle) = raw_server(StatusCode::OK, body, "/healthz").await;
+        let client = RollupBoostHealthClient::new(RollupBoostHealthConfig::Json {
+            url: url.join("/healthz").unwrap().to_string(),
+            timeout: Duration::from_secs(1),
+        });
+
+        let status = client.check().await.unwrap();
+
+        assert_eq!(status, RollupBoostHealthStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn json_health_decodes_first_json_value_like_upstream() {
+        let body = r#"{"version":"v1","rollup_boost_health":"Healthy"}{"ignored":true}"#;
+        let (url, _handle) = raw_server(StatusCode::OK, body.to_string(), "/healthz").await;
         let client = RollupBoostHealthClient::new(RollupBoostHealthConfig::Json {
             url: url.join("/healthz").unwrap().to_string(),
             timeout: Duration::from_secs(1),

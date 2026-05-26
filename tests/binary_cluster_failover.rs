@@ -630,13 +630,37 @@ async fn three_conductor_binaries_fail_over_and_repair_stale_kona_node() {
     let public_leader_id = assert_public_ha_contract(&mut nodes, 3).await;
     assert_eq!(public_leader_id, first_leader_id);
 
-    for id in ["seq-b", "seq-c"] {
-        nodes[by_id[id]].kona.set_latest(hash(0x09), 9);
-    }
-    let first_leader = &nodes[leader_index];
-    first_leader.kona.set_peer_count(0);
+    let transfer_target_id = ["seq-a", "seq-b", "seq-c"]
+        .into_iter()
+        .find(|id| *id != first_leader_id)
+        .unwrap()
+        .to_string();
+    let transfer_target_addr = nodes[by_id[&transfer_target_id]].consensus_addr.clone();
+    let response = conductor_call(
+        &nodes[leader_index].rpc_url,
+        "conductor_transferLeaderToServer",
+        json!([transfer_target_id.clone(), transfer_target_addr]),
+    )
+    .await
+    .unwrap();
+    assert!(response.get("error").is_none(), "{response}");
 
-    let next_leader_id = wait_leader_id(&mut nodes, Some(&first_leader_id)).await;
+    let transferred_leader_id = wait_leader_id(&mut nodes, Some(&first_leader_id)).await;
+    assert_eq!(transferred_leader_id, transfer_target_id);
+    wait_for_start(&mut nodes, &transferred_leader_id, committed_hash).await;
+    let public_leader_id = assert_public_ha_contract(&mut nodes, 3).await;
+    assert_eq!(public_leader_id, transferred_leader_id);
+
+    for node in &nodes {
+        if node.id != transferred_leader_id {
+            node.kona.set_latest(hash(0x09), 9);
+        }
+    }
+    let transferred_leader_index = by_id[&transferred_leader_id];
+    let transferred_leader = &nodes[transferred_leader_index];
+    transferred_leader.kona.set_peer_count(0);
+
+    let next_leader_id = wait_leader_id(&mut nodes, Some(&transferred_leader_id)).await;
     let next_index = by_id[&next_leader_id];
 
     wait_for_start(&mut nodes, &next_leader_id, committed_hash).await;
@@ -650,20 +674,119 @@ async fn three_conductor_binaries_fail_over_and_repair_stale_kona_node() {
     );
     assert!(next.kona.active());
     assert_eq!(next.kona.parameterless_starts(), 0);
-    assert_eq!(next.kona.hash_param_starts(), vec![committed_hash]);
+    assert!(next.kona.hash_param_starts().contains(&committed_hash));
 
-    let old_leader = &nodes[leader_index];
+    let old_leader = &nodes[transferred_leader_index];
     assert!(!old_leader.kona.active());
-    assert_eq!(old_leader.kona.stops(), 1);
-    assert_eq!(old_leader.kona.hash_param_starts(), vec![committed_hash]);
+    assert!(old_leader.kona.stops() >= 1);
+    assert!(old_leader
+        .kona
+        .hash_param_starts()
+        .contains(&committed_hash));
     assert_eq!(old_leader.kona.parameterless_starts(), 0);
 
     for node in &nodes {
         assert_eq!(node.kona.parameterless_starts(), 0);
-        if node.id != first_leader_id && node.id != next_leader_id {
+        if node.id != first_leader_id
+            && node.id != transferred_leader_id
+            && node.id != next_leader_id
+        {
             assert!(!node.kona.active(), "{} should not be sequencing", node.id);
             assert!(node.kona.hash_param_starts().is_empty());
             assert!(node.kona.posted_payloads().is_empty());
         }
     }
+}
+
+#[tokio::test]
+async fn conductor_binary_demotes_current_leader_and_removes_raft_member() {
+    let storage_dir = tempfile::tempdir().unwrap();
+    let committed_hash = kona_payload_hash();
+    let mut nodes = Vec::new();
+    for (id, bootstrap) in [("seq-a", true), ("seq-b", false)] {
+        nodes.push(
+            spawn_node(
+                id,
+                bootstrap,
+                &storage_dir,
+                Arc::new(FakeKonaState::new(committed_hash, 10)),
+            )
+            .await,
+        );
+    }
+    wait_rpc_ready(&mut nodes).await;
+
+    let by_id = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let old_leader_id = wait_leader_id(&mut nodes, None).await;
+    let old_leader_index = by_id[&old_leader_id];
+
+    let node_id = nodes[by_id["seq-b"]].id.clone();
+    let node_consensus_addr = nodes[by_id["seq-b"]].consensus_addr.clone();
+    let response = conductor_call(
+        &nodes[old_leader_index].rpc_url,
+        "conductor_addServerAsNonvoter",
+        json!([node_id.clone(), node_consensus_addr.clone(), 0]),
+    )
+    .await
+    .unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    wait_for_member_suffrage(&mut nodes[old_leader_index], &node_id, 1).await;
+
+    let response = conductor_call(
+        &nodes[old_leader_index].rpc_url,
+        "conductor_addServerAsVoter",
+        json!([node_id.clone(), node_consensus_addr, 0]),
+    )
+    .await
+    .unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    wait_for_member_suffrage(&mut nodes[old_leader_index], &node_id, 0).await;
+
+    let response = conductor_call(
+        &nodes[old_leader_index].rpc_url,
+        "conductor_demoteVoter",
+        json!([old_leader_id.clone(), 0]),
+    )
+    .await
+    .unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+
+    let new_leader_id = wait_leader_id(&mut nodes, Some(&old_leader_id)).await;
+    assert_eq!(new_leader_id, node_id);
+    let new_leader_index = by_id[&new_leader_id];
+    wait_for_member_suffrage(&mut nodes[new_leader_index], &old_leader_id, 1).await;
+
+    let response = conductor_call(
+        &nodes[new_leader_index].rpc_url,
+        "conductor_removeServer",
+        json!([old_leader_id.clone(), 0]),
+    )
+    .await
+    .unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    wait_for_membership(&mut nodes[new_leader_index], 1).await;
+    assert_child_running(&mut nodes[old_leader_index]);
+
+    let membership = conductor_call(
+        &nodes[new_leader_index].rpc_url,
+        "conductor_clusterMembership",
+        json!([]),
+    )
+    .await
+    .unwrap();
+    let servers = membership
+        .get("result")
+        .and_then(|result| result.get("servers"))
+        .and_then(Value::as_array)
+        .unwrap();
+    assert!(
+        servers
+            .iter()
+            .all(|server| server.get("id").and_then(Value::as_str) != Some(old_leader_id.as_str())),
+        "{membership}"
+    );
 }

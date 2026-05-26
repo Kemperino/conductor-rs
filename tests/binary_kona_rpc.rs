@@ -162,6 +162,32 @@ async fn fake_kona_handler(
                 }
             })
         }
+        "optimism_outputAtBlock" => {
+            if params != [json!("0xa")] {
+                return Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32602, "message": "expected hex output block lookup"}
+                }));
+            }
+            let (hash, number) = *state.latest.lock().unwrap();
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "version": "0x0",
+                    "outputRoot": hash,
+                    "blockRef": {"hash": hash, "number": number}
+                }
+            })
+        }
+        "optimism_rollupConfig" => {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {"l2_chain_id": 10, "block_time": 2}
+            })
+        }
         "opp2p_peerStats" => {
             json!({"jsonrpc": "2.0", "id": id, "result": {"connected": "0x1"}})
         }
@@ -179,6 +205,16 @@ async fn fake_kona_handler(
                 "id": id,
                 "result": {"hash": hash, "number": format!("0x{number:x}")}
             })
+        }
+        "miner_setMaxDASize" => {
+            if params != [json!("0x10"), json!("0x20")] {
+                return Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32602, "message": "expected max DA size params"}
+                }));
+            }
+            json!({"jsonrpc": "2.0", "id": id, "result": true})
         }
         _ => json!({
             "jsonrpc": "2.0",
@@ -409,6 +445,62 @@ async fn wait_for_pprof(child: &mut ChildGuard, pprof_port: u16) -> String {
     }
 }
 
+async fn wait_for_metrics(child: &mut ChildGuard, metrics_port: u16) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let url = format!("http://127.0.0.1:{metrics_port}/metrics");
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("conductor-rs exited before metrics became reachable: {status}");
+        }
+        if let Ok(response) = reqwest::get(&url).await {
+            if response.status().is_success() {
+                return response.text().await.unwrap();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for conductor metrics"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn assert_binary_proxy_surface(rpc_url: &Url, expected_hash: Hash) {
+    let latest = conductor_call(rpc_url, "eth_getBlockByNumber", json!(["latest", false]))
+        .await
+        .unwrap();
+    assert_eq!(latest["result"]["hash"], json!(expected_hash));
+    assert_eq!(latest["result"]["number"], json!("0xa"));
+
+    let sync_status = conductor_call(rpc_url, "optimism_syncStatus", json!([]))
+        .await
+        .unwrap();
+    assert_eq!(
+        sync_status["result"]["unsafe_l2"]["hash"],
+        json!(expected_hash)
+    );
+
+    let output = conductor_call(rpc_url, "optimism_outputAtBlock", json!(["0xa"]))
+        .await
+        .unwrap();
+    assert_eq!(output["result"]["outputRoot"], json!(expected_hash));
+
+    let rollup_config = conductor_call(rpc_url, "optimism_rollupConfig", json!([]))
+        .await
+        .unwrap();
+    assert_eq!(rollup_config["result"]["l2_chain_id"], json!(10));
+
+    let active = conductor_call(rpc_url, "admin_sequencerActive", json!([]))
+        .await
+        .unwrap();
+    assert_eq!(active.get("result").and_then(Value::as_bool), Some(false));
+
+    let max_da = conductor_call(rpc_url, "miner_setMaxDASize", json!(["0x10", "0x20"]))
+        .await
+        .unwrap();
+    assert_eq!(max_da.get("result").and_then(Value::as_bool), Some(true));
+}
+
 async fn wait_for_leader(child: &mut ChildGuard, rpc_url: &Url) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -503,13 +595,26 @@ async fn conductor_binary_starts_hash_gated_kona_endpoint_after_commit() {
     let storage_dir = tempfile::tempdir().unwrap();
     let rpc_port = free_port();
     let pprof_port = free_port();
+    let metrics_port = free_port();
     let rpc_url = Url::parse(&format!("http://127.0.0.1:{rpc_port}")).unwrap();
-    let mut child = spawn_conductor(&kona_url, &storage_dir, rpc_port, pprof_port);
+    let extra_args = vec![
+        "--metrics.enabled".to_string(),
+        "--metrics.addr".to_string(),
+        "127.0.0.1".to_string(),
+        "--metrics.port".to_string(),
+        metrics_port.to_string(),
+    ];
+    let mut child =
+        spawn_conductor_with_extra_args(&kona_url, &storage_dir, rpc_port, pprof_port, &extra_args);
 
     wait_for_leader(&mut child, &rpc_url).await;
     let pprof_index = wait_for_pprof(&mut child, pprof_port).await;
     assert!(pprof_index.contains("/debug/pprof/profile"));
     assert!(pprof_index.contains("/debug/pprof/heap"));
+    let metrics = wait_for_metrics(&mut child, metrics_port).await;
+    assert!(metrics.contains("op_conductor_up 1"));
+    assert!(metrics.contains("op_conductor_rpc_server_requests_total"));
+    assert_binary_proxy_surface(&rpc_url, expected_hash).await;
 
     let paused = conductor_call(&rpc_url, "conductor_paused", json!([]))
         .await
