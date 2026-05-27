@@ -103,24 +103,9 @@ and `nc`.
 ## Verification
 
 ```sh
-scripts/verify-production-readiness.sh
+just verify
 ```
 
-The readiness script is self-contained in this repository. It runs format,
-tests, clippy, a Docker image build, `op-conductor --help`, and a container
-smoke check for the wrapper tools. It does not require an Optimism checkout,
-submodule, or workspace-specific path.
-
-Optional live checks are available through ignored integration tests:
-
-```sh
-CONDUCTOR_RS_RUN_LIVE=1 \
-CONDUCTOR_RS_LIVE_KONA_NODE_RPC=http://127.0.0.1:9545 \
-CONDUCTOR_RS_LIVE_KONA_EXECUTION_RPC=http://127.0.0.1:8545 \
-scripts/verify-production-readiness.sh
-```
-
-For a live conductor cluster, set `CONDUCTOR_RS_LIVE_CONDUCTOR_RPCS` to a
-comma-separated list of conductor RPC URLs. Add the narrower
-`CONDUCTOR_RS_LIVE_*` flags from `tests/live_kona_conformance.rs` only when an
-isolated devnet can safely mutate sequencer state.
+The default `just` recipe runs format, tests, clippy, a Docker image build,
+`op-conductor --help`, and a container smoke check for the wrapper tools. It
+does not require an Optimism checkout, submodule, or workspace-specific path.
