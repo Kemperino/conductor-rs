@@ -55,6 +55,7 @@ impl SequencerError {
 #[async_trait::async_trait]
 pub trait SequencerControl: Send + Sync + std::fmt::Debug {
     async fn latest_unsafe_block(&self) -> Result<BlockInfo, SequencerError>;
+    async fn block_by_number(&self, number: u64) -> Result<BlockInfo, SequencerError>;
     async fn start_sequencer(&self, expected_hash: Hash) -> Result<(), SequencerError>;
     async fn stop_sequencer(&self) -> Result<Hash, SequencerError>;
     async fn sequencer_active(&self) -> Result<bool, SequencerError>;
@@ -110,6 +111,10 @@ impl SequencerController {
 impl SequencerControl for SequencerController {
     async fn latest_unsafe_block(&self) -> Result<BlockInfo, SequencerError> {
         Ok(self.execution.latest_unsafe_block().await?)
+    }
+
+    async fn block_by_number(&self, number: u64) -> Result<BlockInfo, SequencerError> {
+        Ok(self.execution.block_by_number(number).await?)
     }
 
     async fn start_sequencer(&self, expected_hash: Hash) -> Result<(), SequencerError> {

@@ -202,9 +202,18 @@ impl ExecutionClient {
     }
 
     pub async fn latest_unsafe_block(&self) -> Result<BlockInfo, RpcClientError> {
+        self.block_by_number_param(json!("latest")).await
+    }
+
+    pub async fn block_by_number(&self, number: u64) -> Result<BlockInfo, RpcClientError> {
+        self.block_by_number_param(json!(format!("0x{number:x}")))
+            .await
+    }
+
+    async fn block_by_number_param(&self, number: Value) -> Result<BlockInfo, RpcClientError> {
         let raw: Value = self
             .rpc
-            .call("eth_getBlockByNumber", json!(["latest", false]))
+            .call("eth_getBlockByNumber", json!([number, false]))
             .await?;
         let hash = raw
             .get("hash")
@@ -377,5 +386,18 @@ mod tests {
         let request = last_request.lock().unwrap().clone().unwrap();
         assert_eq!(request["method"], "eth_getBlockByNumber");
         assert_eq!(request["params"], json!(["latest", false]));
+    }
+
+    #[tokio::test]
+    async fn block_by_number_uses_hex_quantity() {
+        let (url, last_request, handle) = recording_rpc_server().await;
+
+        let block = ExecutionClient::new(url).block_by_number(42).await.unwrap();
+        handle.abort();
+
+        assert_eq!(block.number, 42);
+        let request = last_request.lock().unwrap().clone().unwrap();
+        assert_eq!(request["method"], "eth_getBlockByNumber");
+        assert_eq!(request["params"], json!(["0x2a", false]));
     }
 }

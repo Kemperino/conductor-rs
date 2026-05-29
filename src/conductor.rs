@@ -575,18 +575,27 @@ where
                 .block_number()
                 .map_err(|_| ConductorError::UnsafeHeadMismatch)?;
             let node_head = self.sequencer.latest_unsafe_block().await?;
+            let mut start_hash = consensus_hash;
 
             if node_head.hash != consensus_hash {
                 if consensus_number > node_head.number
                     && consensus_number - node_head.number <= self.cfg.unsafe_repair_depth
                 {
                     self.sequencer.post_unsafe_payload(&unsafe_payload).await?;
+                } else if node_head.number > consensus_number {
+                    // Kona can advance beyond Raft when conductor commits fail; only trust the
+                    // ahead local head if it still descends from the replicated unsafe head.
+                    let ancestor = self.sequencer.block_by_number(consensus_number).await?;
+                    if ancestor.hash != consensus_hash {
+                        return Err(ConductorError::UnsafeHeadMismatch);
+                    }
+                    start_hash = node_head.hash;
                 } else {
                     return Err(ConductorError::UnsafeHeadMismatch);
                 }
             }
 
-            match self.sequencer.start_sequencer(consensus_hash).await {
+            match self.sequencer.start_sequencer(start_hash).await {
                 Ok(()) => {}
                 Err(err) if err.is_sequencer_already_started() => {
                     already_started = true;
@@ -846,7 +855,7 @@ mod tests {
     };
     use serde_json::Value;
     use std::{
-        collections::VecDeque,
+        collections::{BTreeMap, VecDeque},
         sync::{atomic::AtomicU64, Mutex as StdMutex},
     };
     use tokio::{net::TcpListener, sync::Notify};
@@ -861,6 +870,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeSequencer {
         latest: StdMutex<Option<BlockInfo>>,
+        blocks: StdMutex<BTreeMap<u64, BlockInfo>>,
         starts: StdMutex<Vec<Hash>>,
         stops: StdMutex<u64>,
         posts: StdMutex<u64>,
@@ -883,6 +893,18 @@ mod tests {
     impl SequencerControl for FakeSequencer {
         async fn latest_unsafe_block(&self) -> Result<BlockInfo, SequencerError> {
             Ok(self.latest.lock().unwrap().clone().unwrap())
+        }
+
+        async fn block_by_number(&self, number: u64) -> Result<BlockInfo, SequencerError> {
+            if let Some(block) = self.blocks.lock().unwrap().get(&number).cloned() {
+                return Ok(block);
+            }
+            let latest = self.latest.lock().unwrap().clone().unwrap();
+            if latest.number == number {
+                Ok(latest)
+            } else {
+                Err(rpc_error("block not found"))
+            }
         }
 
         async fn start_sequencer(&self, expected_hash: Hash) -> Result<(), SequencerError> {
@@ -963,6 +985,13 @@ mod tests {
                     hash: payload.block_hash().unwrap(),
                     number: payload.block_number().unwrap(),
                 });
+                self.blocks.lock().unwrap().insert(
+                    payload.block_number().unwrap(),
+                    BlockInfo {
+                        hash: payload.block_hash().unwrap(),
+                        number: payload.block_number().unwrap(),
+                    },
+                );
             }
             Ok(())
         }
@@ -1173,6 +1202,13 @@ mod tests {
             hash: hash(0x10),
             number: 10,
         });
+        sequencer.blocks.lock().unwrap().insert(
+            10,
+            BlockInfo {
+                hash: hash(0x10),
+                number: 10,
+            },
+        );
         let conductor = Conductor::new(consensus, sequencer.clone(), cfg);
         (conductor, sequencer)
     }
@@ -1590,6 +1626,50 @@ mod tests {
         let err = conductor.update_leader(true).await.unwrap_err();
         assert!(matches!(err, ConductorError::UnsafeHeadMismatch));
         assert!(sequencer.starts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn starts_ahead_candidate_when_raft_head_is_ancestor() {
+        let (conductor, sequencer) = test_conductor().await;
+        *sequencer.latest.lock().unwrap() = Some(BlockInfo {
+            hash: hash(0x12),
+            number: 12,
+        });
+        sequencer.blocks.lock().unwrap().insert(
+            12,
+            BlockInfo {
+                hash: hash(0x12),
+                number: 12,
+            },
+        );
+
+        conductor.update_leader(true).await.unwrap();
+
+        assert_eq!(*sequencer.posts.lock().unwrap(), 0);
+        assert_eq!(sequencer.starts.lock().unwrap().as_slice(), &[hash(0x12)]);
+        assert!(conductor.seq_active.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn refuses_ahead_candidate_when_raft_head_is_not_ancestor() {
+        let (conductor, sequencer) = test_conductor().await;
+        *sequencer.latest.lock().unwrap() = Some(BlockInfo {
+            hash: hash(0x12),
+            number: 12,
+        });
+        sequencer.blocks.lock().unwrap().insert(
+            10,
+            BlockInfo {
+                hash: hash(0xaa),
+                number: 10,
+            },
+        );
+
+        let err = conductor.update_leader(true).await.unwrap_err();
+
+        assert!(matches!(err, ConductorError::UnsafeHeadMismatch));
+        assert!(sequencer.starts.lock().unwrap().is_empty());
+        assert!(!conductor.seq_active.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
