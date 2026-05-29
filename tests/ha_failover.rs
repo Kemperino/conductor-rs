@@ -6,6 +6,7 @@ use conductor_rs::{
     RaftConsensus,
 };
 use std::{
+    collections::BTreeMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -16,6 +17,7 @@ use std::{
 #[derive(Debug)]
 struct FakeSequencer {
     latest: Mutex<BlockInfo>,
+    blocks: Mutex<BTreeMap<u64, BlockInfo>>,
     starts: Mutex<Vec<Hash>>,
     stops: Mutex<u64>,
     posts: Mutex<Vec<PayloadEnvelope>>,
@@ -25,8 +27,11 @@ struct FakeSequencer {
 
 impl FakeSequencer {
     fn new(latest: BlockInfo) -> Self {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(latest.number, latest.clone());
         Self {
             latest: Mutex::new(latest),
+            blocks: Mutex::new(blocks),
             starts: Mutex::new(Vec::new()),
             stops: Mutex::new(0),
             posts: Mutex::new(Vec::new()),
@@ -36,6 +41,10 @@ impl FakeSequencer {
     }
 
     fn set_latest(&self, latest: BlockInfo) {
+        self.blocks
+            .lock()
+            .unwrap()
+            .insert(latest.number, latest.clone());
         *self.latest.lock().unwrap() = latest;
     }
 
@@ -64,6 +73,16 @@ impl FakeSequencer {
 impl SequencerControl for FakeSequencer {
     async fn latest_unsafe_block(&self) -> Result<BlockInfo, SequencerError> {
         Ok(self.latest.lock().unwrap().clone())
+    }
+
+    async fn block_by_number(&self, number: u64) -> Result<BlockInfo, SequencerError> {
+        if let Some(block) = self.blocks.lock().unwrap().get(&number).cloned() {
+            Ok(block)
+        } else {
+            Err(SequencerError::Rpc(
+                conductor_rs::rpc::RpcClientError::InvalidResponse("block not found".to_string()),
+            ))
+        }
     }
 
     async fn start_sequencer(&self, expected_hash: Hash) -> Result<(), SequencerError> {
@@ -255,6 +274,67 @@ async fn real_raft_failover_repairs_stale_candidate_before_starting() {
 
     assert_eq!(next.1.posts(), vec![committed]);
     assert_eq!(next.1.starts(), vec![hash(0x10)]);
+    assert!(next.1.active());
+
+    for node in &nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn real_raft_failover_starts_ahead_candidate_on_same_chain() {
+    let nodes = test_cluster().await;
+    let first_leader_id = wait_for_leader_matching(&nodes, |_| true).await;
+    let committed = payload(10, 0x10);
+    let first_leader = nodes
+        .iter()
+        .find(|node| node.server_id() == first_leader_id)
+        .unwrap();
+
+    first_leader.commit_unsafe_payload(committed).await.unwrap();
+    for node in &nodes {
+        wait_payload(node, payload(10, 0x10)).await;
+    }
+
+    let conductors = nodes
+        .iter()
+        .map(|node| {
+            let sequencer = Arc::new(FakeSequencer::new(block(10, 0x10)));
+            let conductor = Conductor::new(
+                node.clone(),
+                sequencer.clone(),
+                ConductorConfig {
+                    round_robin_leader_transfer: true,
+                    unsafe_repair_depth: 1,
+                    ..ConductorConfig::default()
+                },
+            );
+            (node.clone(), sequencer, conductor)
+        })
+        .collect::<Vec<_>>();
+
+    let first = conductors
+        .iter()
+        .find(|(node, _, _)| node.server_id() == first_leader_id)
+        .unwrap();
+
+    first.2.tick().await.unwrap();
+    assert_eq!(first.1.starts(), vec![hash(0x10)]);
+
+    first.1.set_peer_count(0);
+    first.2.tick().await.unwrap();
+
+    let next_leader_id = wait_for_leader_matching(&nodes, |id| id != first_leader_id).await;
+    let next = conductors
+        .iter()
+        .find(|(node, _, _)| node.server_id() == next_leader_id)
+        .unwrap();
+    next.1.set_latest(block(12, 0x12));
+
+    next.2.tick().await.unwrap();
+
+    assert!(next.1.posts().is_empty());
+    assert_eq!(next.1.starts(), vec![hash(0x12)]);
     assert!(next.1.active());
 
     for node in &nodes {

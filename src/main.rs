@@ -2123,6 +2123,10 @@ mod tests {
             unimplemented!()
         }
 
+        async fn block_by_number(&self, _number: u64) -> Result<BlockInfo, SequencerError> {
+            unimplemented!()
+        }
+
         async fn start_sequencer(&self, _expected_hash: Hash) -> Result<(), SequencerError> {
             unimplemented!()
         }
@@ -2210,6 +2214,13 @@ mod tests {
     #[async_trait::async_trait]
     impl SequencerControl for FakeLoopSequencer {
         async fn latest_unsafe_block(&self) -> Result<BlockInfo, SequencerError> {
+            Ok(BlockInfo {
+                hash: test_hash(0x10),
+                number: 10,
+            })
+        }
+
+        async fn block_by_number(&self, _number: u64) -> Result<BlockInfo, SequencerError> {
             Ok(BlockInfo {
                 hash: test_hash(0x10),
                 number: 10,
