@@ -803,6 +803,13 @@ mod tests {
             })
         }
 
+        async fn block_by_number(&self, _number: u64) -> Result<BlockInfo, SequencerError> {
+            Ok(BlockInfo {
+                hash: Hash::ZERO,
+                number: 0,
+            })
+        }
+
         async fn start_sequencer(&self, _expected_hash: Hash) -> Result<(), SequencerError> {
             self.active.store(true, Ordering::SeqCst);
             Ok(())
